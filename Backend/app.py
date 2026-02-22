@@ -65,7 +65,7 @@ print(f"[STARTUP] DATASET_DIR={DATASET_DIR} exists={os.path.isdir(DATASET_DIR)}"
 app = Flask(__name__)
 
 # Allow requests from your Vercel frontend (and localhost for dev)
-ALLOWED_ORIGINS = os.getenv('ALLOWED_ORIGINS', 'http://localhost:5173','https://margin-call-puce.vercel.app/').split(',')
+ALLOWED_ORIGINS = os.getenv('ALLOWED_ORIGINS', 'http://localhost:5173,https://margin-call-puce.vercel.app').split(',')
 CORS(app, origins=ALLOWED_ORIGINS, supports_credentials=True)
 
 # Load Featherless API Key
