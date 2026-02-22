@@ -4,6 +4,7 @@ charset-normalizer
 click
 Flask
 flask-cors
+gunicorn
 idna
 itsdangerous
 Jinja2
