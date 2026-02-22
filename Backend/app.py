@@ -142,6 +142,7 @@ SIM_STATE = {
     'interbank_matrix': None,
     'network_simulator': None,
     'forecast_simulator': None,    # Forecast simulator for time-based projections
+    'trained_models': None,        # Trained RL models (bank_policies.pkl + ccp_policy.pkl)
 }
 
 
@@ -267,6 +268,18 @@ class NetworkSimulator:
         health = capital_score + liquidity_score - risk_penalty
         return max(0.0, min(100.0, health))
 
+    def get_bank_features(self, bank: str) -> np.ndarray:
+        """Get normalized feature vector for a bank (for RL model inference)."""
+        state = self.current_state
+        features = np.array([
+            state.assets.get(bank, 0),
+            state.equity.get(bank, 0),
+            state.liquidity.get(bank, 0),
+            self.banks_df[self.banks_df['Bank'] == bank]['Net_Outflows_30d'].values[0],
+            sum(state.exposures.get(bank, {}).values())
+        ]).reshape(1, -1)
+        return self.scaler.transform(features).flatten()
+
     def run_contagion(self, failure_threshold: float = 20.0) -> Dict:
         state = self.current_state
         initial_failed = state.failed_banks.copy()
@@ -356,6 +369,109 @@ class CCPPayoffCalculator:
             })
         
         return breakdown
+
+
+# ============================================================================
+# TRAINED MODEL INFERENCE
+# ============================================================================
+class TrainedModelInference:
+    """
+    Loads trained bank and CCP RL policy models (pkl files) and provides
+    inference for calculating optimal margin requirements and minimum CCP
+    default fund needed to prevent systemic collapse.
+
+    bank_policies.pkl: dict {bank_name: MLPRegressor} - each bank's trained Q-network
+        Input: 5 normalized features [Total_Assets, Equity, HQLA, Net_Outflows_30d, Exposures]
+        Output: 9 Q-values (3 trade sizes x 3 directions)
+
+    ccp_policy.pkl: MLPRegressor - CCP's trained Q-network
+        Input: 8 features [5 bank features + trade_size + predicted_risk + direction]
+        Output: 6 Q-values (5 margin levels [5%, 10%, 20%, 30%, 50%] + reject)
+    """
+
+    MARGIN_LEVELS = [0.05, 0.10, 0.20, 0.30, 0.50]
+    TRADE_SIZES = [0.01, 0.05, 0.10]  # Fraction of HQLA
+    DIRECTIONS = ['BUY', 'SELL', 'HOLD']
+
+    def __init__(self, bank_model_path: str, ccp_model_path: str):
+        self.bank_policies = None
+        self.ccp_policy = None
+        self.loaded = False
+        self._load_models(bank_model_path, ccp_model_path)
+
+    def _load_models(self, bank_path: str, ccp_path: str):
+        """Load trained models from pickle files."""
+        try:
+            if os.path.exists(bank_path):
+                with open(bank_path, 'rb') as f:
+                    self.bank_policies = pickle.load(f)
+                print(f"\u2705 Loaded bank policies for {len(self.bank_policies)} banks")
+            else:
+                print(f"\u26a0\ufe0f  Bank policies not found at {bank_path}")
+
+            if os.path.exists(ccp_path):
+                with open(ccp_path, 'rb') as f:
+                    self.ccp_policy = pickle.load(f)
+                print("\u2705 Loaded CCP policy model")
+            else:
+                print(f"\u26a0\ufe0f  CCP policy not found at {ccp_path}")
+
+            self.loaded = self.bank_policies is not None and self.ccp_policy is not None
+        except Exception as e:
+            print(f"\u274c Error loading trained models: {e}")
+            self.loaded = False
+
+    def predict_bank_action(self, bank_name: str, bank_features: np.ndarray, hqla: float) -> Optional[Dict]:
+        """
+        Use trained bank policy to predict what trade action a bank would take.
+        Returns trade size, direction, and Q-value confidence.
+        """
+        if not self.bank_policies or bank_name not in self.bank_policies:
+            return None
+
+        model = self.bank_policies[bank_name]
+        q_values = model.predict(bank_features.reshape(1, -1))[0]
+        best_action = int(np.argmax(q_values))
+
+        size_idx = best_action // 3
+        dir_idx = best_action % 3
+
+        direction = self.DIRECTIONS[dir_idx]
+        trade_size = hqla * self.TRADE_SIZES[min(size_idx, 2)] if direction != 'HOLD' else 0
+
+        return {
+            'trade_size': trade_size,
+            'direction': direction,
+            'q_value': float(np.max(q_values)),
+        }
+
+    def predict_ccp_margin(self, bank_features: np.ndarray, trade_size: float,
+                           predicted_risk: float, direction: str) -> Optional[Dict]:
+        """
+        Use trained CCP policy to determine the optimal margin requirement.
+        Returns margin level and decision (approve/reject).
+        """
+        if self.ccp_policy is None:
+            return None
+
+        dir_indicator = 1.0 if direction == 'BUY' else 0.0
+        features = np.concatenate([
+            bank_features,
+            [trade_size, predicted_risk, dir_indicator]
+        ])
+
+        q_values = self.ccp_policy.predict(features.reshape(1, -1))[0]
+        action_idx = int(np.argmax(q_values))
+
+        if action_idx >= len(self.MARGIN_LEVELS):
+            return {'decision': 'REJECTED', 'margin': 1.0, 'margin_pct': 100.0}
+
+        margin = self.MARGIN_LEVELS[action_idx]
+        return {
+            'decision': 'APPROVED',
+            'margin': margin,
+            'margin_pct': margin * 100,
+        }
 
 
 # ============================================================================
@@ -1211,7 +1327,17 @@ def init_simulation():
         os.path.join(DATASET_DIR, 'stocks_data_long.csv'),
         os.path.join(DATASET_DIR, 'us_banks_interbank_matrix.csv')
     )
-    
+
+    # Load trained RL models (bank_policies.pkl + ccp_policy.pkl)
+    print("[INIT] Loading trained RL models...")
+    bank_model_path = os.path.join(BACKEND_DIR, CONFIG['BANK_MODEL_PATH'])
+    ccp_model_path = os.path.join(BACKEND_DIR, CONFIG['CCP_MODEL_PATH'])
+    SIM_STATE['trained_models'] = TrainedModelInference(bank_model_path, ccp_model_path)
+    if SIM_STATE['trained_models'].loaded:
+        print("[INIT] Trained models loaded successfully - CCP minimum fund analysis available")
+    else:
+        print("[INIT] WARNING: Trained models not fully loaded - CCP analysis will be limited")
+
     # Initialize ForecastSimulator for time-based projections
     print("[INIT] Initializing forecast simulator...")
     SIM_STATE['forecast_simulator'] = ForecastSimulator(
@@ -1222,6 +1348,157 @@ def init_simulation():
 
     print(f"[INIT] Ready — {len(SIM_STATE['bank_attrs'])} banks, "
           f"{len(prices)} selected stocks, {len(all_prices)} total stocks available for shock")
+
+
+# ─── CCP Minimum Fund Analysis ────────────────────────────────────────────────
+
+def _analyze_ccp_minimum_fund(shock_type: str, shock_params: dict,
+                              failure_threshold: float = 20.0) -> dict:
+    """
+    Use trained bank and CCP RL policies to calculate the minimum CCP default
+    fund needed to prevent systemic collapse for a given shock scenario.
+
+    The CCP collects margins from banks based on its trained policy. The minimum
+    fund is the additional reserve needed beyond those margins to cover all
+    potential losses from bank failures.
+
+    Minimum CCP Fund = Total Shortfall from Failed Banks - Total Margins Collected
+
+    Args:
+        shock_type: 'bank' or 'stock'
+        shock_params: {'bank': str, 'shock_pct': float} or {'shocks': {ticker: pct}}
+        failure_threshold: Health score below which banks fail
+
+    Returns:
+        Dict with minimum fund analysis, or partial result if models unavailable.
+    """
+    trained_models = SIM_STATE.get('trained_models')
+    network_sim = SIM_STATE.get('network_simulator')
+
+    if trained_models is None or not trained_models.loaded or network_sim is None:
+        return {'models_used': False, 'message': 'Trained RL models not available'}
+
+    # Reset network simulator to clean state
+    network_sim.reset()
+    state = network_sim.get_state()
+
+    # ── Apply the shock ──────────────────────────────────────────────────────
+    if shock_type == 'bank':
+        bank_name = shock_params['bank']
+        shock_pct = shock_params['shock_pct']
+        shock_fraction = shock_pct / 100.0
+        shock_amount = state.assets.get(bank_name, 0) * shock_fraction
+        state.equity[bank_name] = state.equity.get(bank_name, 0) - shock_amount
+        state.assets[bank_name] = state.assets.get(bank_name, 0) - shock_amount
+        if state.equity.get(bank_name, 0) <= 0:
+            state.failed_banks.add(bank_name)
+
+    elif shock_type == 'stock':
+        shocks = shock_params['shocks']
+        holdings = SIM_STATE.get('holdings', {})
+        all_stock_prices = SIM_STATE.get('all_stock_prices', {})
+
+        for ticker, pct in shocks.items():
+            if ticker not in all_stock_prices:
+                continue
+            old_price = all_stock_prices[ticker]
+            new_price = old_price * (1 - pct / 100.0)
+
+            banks_affected = False
+            for bank in network_sim.bank_list:
+                if bank in holdings and ticker in holdings.get(bank, {}):
+                    banks_affected = True
+                    shares = holdings[bank][ticker]
+                    loss_b = shares * (old_price - new_price) / 1e9
+                    if loss_b > 0:
+                        state.assets[bank] -= loss_b
+                        state.equity[bank] -= loss_b
+
+            if not banks_affected:
+                market_impact = (pct / 100.0) * 0.1 * 0.01
+                for bank in network_sim.bank_list:
+                    loss = state.assets.get(bank, 0) * market_impact
+                    state.assets[bank] -= loss
+                    state.equity[bank] -= loss
+
+    # ── Use trained RL models to predict bank trading and CCP margins ────────
+    total_margin_collected = 0.0
+    bank_margin_details = {}
+
+    for bank in network_sim.bank_list:
+        if bank in state.failed_banks:
+            continue
+        try:
+            bank_features = network_sim.get_bank_features(bank)
+            hqla = state.liquidity.get(bank, 0)
+
+            # Predict bank's trade action using trained bank policy
+            bank_action = trained_models.predict_bank_action(bank, bank_features, hqla)
+            if bank_action is None or bank_action['direction'] == 'HOLD' or bank_action['trade_size'] <= 0:
+                continue
+
+            trade_size = bank_action['trade_size']
+
+            # Calculate predicted risk for CCP evaluation
+            avg_vol = np.mean(list(state.stock_volatility.values())) if state.stock_volatility else 0.02
+            predicted_risk = trade_size * avg_vol * CONFIG['CRASH_SEVERITY']
+
+            # Get CCP's optimal margin decision using trained CCP policy
+            ccp_decision = trained_models.predict_ccp_margin(
+                bank_features, trade_size, predicted_risk, bank_action['direction']
+            )
+
+            if ccp_decision and ccp_decision['decision'] == 'APPROVED':
+                margin_amount = trade_size * ccp_decision['margin']
+                total_margin_collected += margin_amount
+                bank_margin_details[bank] = {
+                    'margin_rate_pct': ccp_decision['margin_pct'],
+                    'margin_amount_B': round(margin_amount, 4),
+                    'trade_size_B': round(trade_size, 4),
+                    'direction': bank_action['direction'],
+                }
+        except Exception:
+            continue
+
+    # ── Run contagion cascade ────────────────────────────────────────────────
+    cascade = network_sim.run_contagion(failure_threshold=failure_threshold)
+    final_state = network_sim.get_state()
+
+    # ── Calculate total shortfall from failed banks ──────────────────────────
+    recovery_rate = 0.40
+    total_shortfall = 0.0
+    failed_bank_details = []
+
+    for bank in final_state.failed_banks:
+        liabilities = final_state.liabilities.get(bank, 0)
+        assets = final_state.assets.get(bank, 0)
+        shortfall = max(0, liabilities - assets * recovery_rate)
+        total_shortfall += shortfall
+        failed_bank_details.append({
+            'bank': bank,
+            'liabilities_B': round(liabilities, 2),
+            'assets_B': round(assets, 2),
+            'shortfall_B': round(shortfall, 2),
+        })
+
+    # ── Minimum CCP Fund = Shortfall - Margin Coverage ───────────────────────
+    minimum_fund = max(0, total_shortfall - total_margin_collected)
+
+    return {
+        'models_used': True,
+        'minimum_ccp_fund_B': round(minimum_fund, 2),
+        'total_shortfall_B': round(total_shortfall, 2),
+        'total_margin_collected_B': round(total_margin_collected, 2),
+        'margin_coverage_pct': round(
+            (total_margin_collected / total_shortfall * 100) if total_shortfall > 0 else 100.0, 2
+        ),
+        'num_failed_banks': len(final_state.failed_banks),
+        'failed_banks': list(final_state.failed_banks),
+        'num_banks_with_margin': len(bank_margin_details),
+        'bank_margins': bank_margin_details,
+        'failed_bank_details': failed_bank_details,
+        'cascade_rounds': cascade['rounds'],
+    }
 
 
 # ─── API Routes ───────────────────────────────────────────────────────────────
@@ -1360,6 +1637,14 @@ def simulate_bank_shock():
     network = _get_post_sim_network(contagion)
     result['network'] = network
 
+    # CCP minimum fund analysis using trained RL models
+    ccp_analysis = _analyze_ccp_minimum_fund(
+        shock_type='bank',
+        shock_params={'bank': bank, 'shock_pct': shock_pct},
+        failure_threshold=threshold
+    )
+    result['ccp_minimum_fund_analysis'] = ccp_analysis
+
     return jsonify(result)
 
 
@@ -1381,6 +1666,14 @@ def simulate_stock_shock():
 
     network = _get_post_sim_network(contagion)
     result['network'] = network
+
+    # CCP minimum fund analysis using trained RL models
+    ccp_analysis = _analyze_ccp_minimum_fund(
+        shock_type='stock',
+        shock_params={'shocks': shocks},
+        failure_threshold=threshold
+    )
+    result['ccp_minimum_fund_analysis'] = ccp_analysis
 
     return jsonify(result)
 
@@ -1463,6 +1756,37 @@ def simulate_stock_shock_forecast():
         shocks, failure_threshold=threshold
     )
 
+    return jsonify(result)
+
+
+@app.route('/api/ccp-minimum-fund', methods=['POST'])
+def get_ccp_minimum_fund():
+    """
+    Standalone endpoint to calculate the minimum CCP default fund needed
+    for a given shock scenario using trained RL models.
+
+    Body (bank shock): { "type": "bank", "bank": "JPM", "shock_pct": 50, "failure_threshold": 20 }
+    Body (stock shock): { "type": "stock", "shocks": {"AAPL": 30}, "failure_threshold": 20 }
+    """
+    data = request.get_json()
+    shock_type = data.get('type', 'bank')
+    threshold = data.get('failure_threshold', 20)
+
+    if shock_type == 'bank':
+        bank = data.get('bank')
+        shock_pct = data.get('shock_pct', 50)
+        if not bank or bank not in SIM_STATE['bank_attrs']:
+            return jsonify({'error': f'Bank not found'}), 400
+        shock_params = {'bank': bank, 'shock_pct': shock_pct}
+    elif shock_type == 'stock':
+        shocks = data.get('shocks', {})
+        if not shocks:
+            return jsonify({'error': 'No stock shocks provided'}), 400
+        shock_params = {'shocks': shocks}
+    else:
+        return jsonify({'error': f'Invalid shock type: {shock_type}'}), 400
+
+    result = _analyze_ccp_minimum_fund(shock_type, shock_params, failure_threshold=threshold)
     return jsonify(result)
 
 
