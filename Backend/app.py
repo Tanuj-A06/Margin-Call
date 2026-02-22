@@ -61,7 +61,10 @@ BACKEND_DIR = os.path.dirname(__file__)
 DATASET_DIR = os.path.join(BACKEND_DIR, 'dataset')
 
 app = Flask(__name__)
-CORS(app)
+
+# Allow requests from your Vercel frontend (and localhost for dev)
+ALLOWED_ORIGINS = os.getenv('ALLOWED_ORIGINS', 'http://localhost:5173','https://margin-call-puce.vercel.app/').split(',')
+CORS(app, origins=ALLOWED_ORIGINS, supports_credentials=True)
 
 # Load Featherless API Key
 FLESS_KEY = os.getenv('FLESS')
@@ -1799,6 +1802,11 @@ def reset_simulation():
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
+# Run init_simulation() at module level so gunicorn (which imports `app`) also triggers it
+init_simulation()
+
 if __name__ == '__main__':
-    init_simulation()
-    app.run(debug=True, port=5000)
+    port = int(os.getenv('PORT', 5000))
+    debug = os.getenv('FLASK_DEBUG', '0') == '1'
+    app.run(debug=debug, host='0.0.0.0', port=port)
+
