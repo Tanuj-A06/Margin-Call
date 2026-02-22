@@ -57,8 +57,10 @@ CONFIG = {
 }
 
 # Paths
-BACKEND_DIR = os.path.dirname(__file__)
+BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 DATASET_DIR = os.path.join(BACKEND_DIR, 'dataset')
+print(f"[STARTUP] BACKEND_DIR={BACKEND_DIR}", flush=True)
+print(f"[STARTUP] DATASET_DIR={DATASET_DIR} exists={os.path.isdir(DATASET_DIR)}", flush=True)
 
 app = Flask(__name__)
 
@@ -1288,69 +1290,76 @@ class BankingNetworkContagion:
 
 def init_simulation():
     """Load all data and build the simulation state once at startup."""
-    print("[INIT] Loading bank attributes...")
-    SIM_STATE['bank_attrs'] = load_bank_attributes(
-        os.path.join(DATASET_DIR, 'us_banks_top50_nodes_final.csv'))
+    try:
+        print("[INIT] Loading bank attributes...", flush=True)
+        SIM_STATE['bank_attrs'] = load_bank_attributes(
+            os.path.join(DATASET_DIR, 'us_banks_top50_nodes_final.csv'))
 
-    print("[INIT] Loading interbank matrix...")
-    SIM_STATE['interbank_matrix'] = load_interbank_matrix(
-        os.path.join(DATASET_DIR, 'us_banks_interbank_matrix.csv'))
+        print("[INIT] Loading interbank matrix...", flush=True)
+        SIM_STATE['interbank_matrix'] = load_interbank_matrix(
+            os.path.join(DATASET_DIR, 'us_banks_interbank_matrix.csv'))
 
-    print("[INIT] Loading ALL stock data...")
-    all_prices, all_ts = load_all_stock_data(
-        os.path.join(DATASET_DIR, 'stocks_data_long.csv'))
-    SIM_STATE['all_stock_prices'] = all_prices
-    SIM_STATE['all_stock_timeseries'] = all_ts
-    print(f"[INIT] Loaded {len(all_prices)} total stocks from dataset")
+        print("[INIT] Loading ALL stock data...", flush=True)
+        all_prices, all_ts = load_all_stock_data(
+            os.path.join(DATASET_DIR, 'stocks_data_long.csv'))
+        SIM_STATE['all_stock_prices'] = all_prices
+        SIM_STATE['all_stock_timeseries'] = all_ts
+        print(f"[INIT] Loaded {len(all_prices)} total stocks from dataset", flush=True)
 
-    print("[INIT] Selecting 10 random stocks for simulation...")
-    prices, ts = load_stock_prices(
-        os.path.join(DATASET_DIR, 'stocks_data_long.csv'), 
-        num_stocks=10, 
-        all_data=(all_prices, all_ts))
-    SIM_STATE['stock_prices'] = prices
-    SIM_STATE['stock_timeseries'] = ts
+        print("[INIT] Selecting 10 random stocks for simulation...", flush=True)
+        prices, ts = load_stock_prices(
+            os.path.join(DATASET_DIR, 'stocks_data_long.csv'), 
+            num_stocks=10, 
+            all_data=(all_prices, all_ts))
+        SIM_STATE['stock_prices'] = prices
+        SIM_STATE['stock_timeseries'] = ts
 
-    print("[INIT] Distributing shares among banks...")
-    SIM_STATE['holdings'] = distribute_shares(SIM_STATE['bank_attrs'], prices)
+        print("[INIT] Distributing shares among banks...", flush=True)
+        SIM_STATE['holdings'] = distribute_shares(SIM_STATE['bank_attrs'], prices)
 
-    print("[INIT] Building interbank graph...")
-    SIM_STATE['graph'] = build_graph(SIM_STATE['bank_attrs'], SIM_STATE['interbank_matrix'])
+        print("[INIT] Building interbank graph...", flush=True)
+        SIM_STATE['graph'] = build_graph(SIM_STATE['bank_attrs'], SIM_STATE['interbank_matrix'])
 
-    for bank in SIM_STATE['graph']:
-        if bank in SIM_STATE['holdings']:
-            SIM_STATE['graph'][bank]['holdings'] = SIM_STATE['holdings'][bank]
+        for bank in SIM_STATE['graph']:
+            if bank in SIM_STATE['holdings']:
+                SIM_STATE['graph'][bank]['holdings'] = SIM_STATE['holdings'][bank]
 
-    SIM_STATE['contagion'] = BankingNetworkContagion(
-        SIM_STATE['graph'], prices, SIM_STATE['interbank_matrix'], all_prices)
+        SIM_STATE['contagion'] = BankingNetworkContagion(
+            SIM_STATE['graph'], prices, SIM_STATE['interbank_matrix'], all_prices)
 
-    # Also initialize NetworkSimulator for advanced shock simulation
-    SIM_STATE['network_simulator'] = NetworkSimulator(
-        os.path.join(DATASET_DIR, 'us_banks_top50_nodes_final.csv'),
-        os.path.join(DATASET_DIR, 'stocks_data_long.csv'),
-        os.path.join(DATASET_DIR, 'us_banks_interbank_matrix.csv')
-    )
+        # Also initialize NetworkSimulator for advanced shock simulation
+        SIM_STATE['network_simulator'] = NetworkSimulator(
+            os.path.join(DATASET_DIR, 'us_banks_top50_nodes_final.csv'),
+            os.path.join(DATASET_DIR, 'stocks_data_long.csv'),
+            os.path.join(DATASET_DIR, 'us_banks_interbank_matrix.csv')
+        )
 
-    # Load trained RL models (bank_policies.pkl + ccp_policy.pkl)
-    print("[INIT] Loading trained RL models...")
-    bank_model_path = os.path.join(BACKEND_DIR, CONFIG['BANK_MODEL_PATH'])
-    ccp_model_path = os.path.join(BACKEND_DIR, CONFIG['CCP_MODEL_PATH'])
-    SIM_STATE['trained_models'] = TrainedModelInference(bank_model_path, ccp_model_path)
-    if SIM_STATE['trained_models'].loaded:
-        print("[INIT] Trained models loaded successfully - CCP minimum fund analysis available")
-    else:
-        print("[INIT] WARNING: Trained models not fully loaded - CCP analysis will be limited")
+        # Load trained RL models (bank_policies.pkl + ccp_policy.pkl)
+        print("[INIT] Loading trained RL models...", flush=True)
+        bank_model_path = os.path.join(BACKEND_DIR, CONFIG['BANK_MODEL_PATH'])
+        ccp_model_path = os.path.join(BACKEND_DIR, CONFIG['CCP_MODEL_PATH'])
+        SIM_STATE['trained_models'] = TrainedModelInference(bank_model_path, ccp_model_path)
+        if SIM_STATE['trained_models'].loaded:
+            print("[INIT] Trained models loaded successfully - CCP minimum fund analysis available", flush=True)
+        else:
+            print("[INIT] WARNING: Trained models not fully loaded - CCP analysis will be limited", flush=True)
 
-    # Initialize ForecastSimulator for time-based projections
-    print("[INIT] Initializing forecast simulator...")
-    SIM_STATE['forecast_simulator'] = ForecastSimulator(
-        SIM_STATE['network_simulator'],
-        all_ts
-    )
-    print(f"[INIT] Forecast simulator ready with {len(SIM_STATE['forecast_simulator'].stock_stats)} stock statistics")
+        # Initialize ForecastSimulator for time-based projections
+        print("[INIT] Initializing forecast simulator...", flush=True)
+        SIM_STATE['forecast_simulator'] = ForecastSimulator(
+            SIM_STATE['network_simulator'],
+            all_ts
+        )
+        print(f"[INIT] Forecast simulator ready with {len(SIM_STATE['forecast_simulator'].stock_stats)} stock statistics", flush=True)
 
-    print(f"[INIT] Ready — {len(SIM_STATE['bank_attrs'])} banks, "
-          f"{len(prices)} selected stocks, {len(all_prices)} total stocks available for shock")
+        print(f"[INIT] Ready — {len(SIM_STATE['bank_attrs'])} banks, "
+              f"{len(prices)} selected stocks, {len(all_prices)} total stocks available for shock", flush=True)
+
+    except Exception as e:
+        import traceback
+        print(f"[INIT] ❌ FATAL ERROR during initialization: {e}", flush=True)
+        traceback.print_exc()
+        print("[INIT] Server will start but simulation endpoints will fail until /api/simulate/reset is called.", flush=True)
 
 
 # ─── CCP Minimum Fund Analysis ────────────────────────────────────────────────

@@ -3,10 +3,10 @@ services:
     name: rarecandy-backend
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 120 --workers 1
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 300 --workers 1 --preload
     envVars:
       - key: ALLOWED_ORIGINS
-        value: https://your-frontend-name.vercel.app
+        value: https://margin-call-puce.vercel.app/
       - key: FLESS
         sync: false
       - key: PYTHON_VERSION
