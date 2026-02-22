@@ -1811,8 +1811,19 @@ def reset_simulation():
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
-# Run init_simulation() at module level so gunicorn (which imports `app`) also triggers it
-init_simulation()
+# Lazy initialization: let gunicorn bind the port first, then load data
+_initialized = False
+
+def ensure_initialized():
+    """Lazy init — called on first API request so gunicorn can bind the port."""
+    global _initialized
+    if not _initialized:
+        init_simulation()
+        _initialized = True
+
+@app.before_request
+def _lazy_init():
+    ensure_initialized()
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))
